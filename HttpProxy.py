@@ -1,3 +1,8 @@
+#_*_ encoding:utf-8 _*_
+#
+#HTTP代理
+#
+
 import http.server
 import http.cookiejar
 import urllib.request
@@ -7,26 +12,31 @@ import threading
 import socketserver
 import ThreadPool
 
+
 http.client.HTTPConnection.debuglevel = 0
 
 class KIZRequestHandler(http.server.SimpleHTTPRequestHandler):
     
-    def __init__(self, request, client_address, server, request_listener=None):
-        self.request_listener = request_listener
+    def __init__(self, request, client_address, server, request_interceptors=[]):
+        self.request_interceptors = request_interceptors
         super().__init__(request, client_address, server)
     
     def do_GET(self):
         valid = self.checkRequest()
         if valid:
-            self.processGet()
+            self.processRequest(method='GET')
 
  
     def do_POST(self):
         valid = self.checkRequest()
         if valid:    
-            self.processGet()
+            self.processRequest(method='POST')
     
     def checkRequest(self):
+        #接收到请求时，按顺序调用拦截器链
+        for interceptor in self.request_interceptors:
+            interceptor.beforeRequest(self)
+        
         if 'Host' in self.headers.keys():
             self.host = self.headers['Host']
             parseResult = urllib.parse.urlparse(self.path)
@@ -34,9 +44,7 @@ class KIZRequestHandler(http.server.SimpleHTTPRequestHandler):
                 self.uri = self.path
             else:
                 self.uri = 'http://' + self.host + self.path
-            if self.request_listener is not None:
-                self.request_listener.log('接收到请求：' + self.requestline)
-            self.parseParam()
+            #self.parseParam()
             return True
         else:
             print('Host is not assigned!')
@@ -47,27 +55,40 @@ class KIZRequestHandler(http.server.SimpleHTTPRequestHandler):
     
     #解析请求参数
     def parseParam(self):
-        self.queryParams = {}
+        encode = 'UTF-8'
+        self.queryParams = []
         if 'Content-Length' in self.headers.keys():   #POST请求体里的参数
-            datas = self.rfile.read(int(self.headers['Content-Length']))
-            datas = urllib.parse.unquote(datas)
-            self.queryParams = transDicts(datas)
+            datas = self.rfile.read(int(self.headers['Content-Length'])).decode(encode, 'ignore')
+            datas = urllib.parse.unquote(datas, encoding=encode)
+            self.queryParams = urllib.parse.parse_qsl(datas, encoding=encode)
         if '?' in self.path:
             query = urllib.parse.splitquery(self.path)
             if query[1]:#接收get参数
-                encode = 'UTF-8'
                 #由于不知道URL中的编码是GBK还是UTF-8,所以先使用UTF-8编码来解码，如果解码的结果再编码后和原来不一致，则不是UTF-8编码
                 queryPms = urllib.parse.unquote(query[1], encoding=encode)
                 tmp = urllib.parse.quote(queryPms, encoding=encode, safe='=&')
                 if tmp != query[1]:
                     encode = 'GBK'
-                params = urllib.parse.parse_qs(query[1], encoding=encode)
-                self.queryParams.update(params)
+                params = urllib.parse.parse_qsl(query[1], encoding=encode)
+                for p in params:
+                    self.queryParams.append(p)      
     
-        print(self.queryParams)    
-    
-    def processGet(self):
-        request = urllib.request.Request(self.uri, headers=self.headers, method='GET')
+    def processRequest(self, method=None):
+        request = None
+        if method.upper() == 'GET':
+            request = urllib.request.Request(self.uri, headers=self.headers, method='GET')
+
+        elif method.upper() == 'POST':
+            datas = self.rfile.read(int(self.headers['Content-Length']))
+            request = urllib.request.Request(self.uri, data=datas, headers=self.headers, method='POST')            
+
+        else:
+            self.send_response(501)
+            self.end_headers()
+            msg = '<h1><b>Unsupported Method:{0}</b></h1>'.format(method)
+            self.wfile.write(msg.encode())
+            return
+        
         try:
             resp = urllib.request.urlopen(request)
         except Exception as e:
@@ -76,75 +97,54 @@ class KIZRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(b'<h1><b>Gateway Timeout</b></h1>')
             print(e)
             return
-        
         respHeader = resp.info()
         data = resp.read()
         
         #如果响应的HTTP报头中指定了是gzip压缩，则先解压缩
         if respHeader['Content-Encoding'] == 'gzip' or data.startswith(b'\x1f\x8b'):
-            isGzip = True
             data = gzip.decompress(data)
             #返回给客户端是gzip解压后的数据，所以删除gzip压缩报头
             del respHeader['Content-Encoding']
             
-    
-        #data += b'<script>alert(document.cookie)</script>'
+        #收到转发后的HTTP请求响应时，调用拦截器链
+        response = {'code':resp.getcode(), 'header':respHeader, 'data':data}
+        for interceptor in self.request_interceptors:
+            interceptor.afterRequest(self, response)
+        
+        respCode = response['code']
+        respHeader = response['header']
+        data = response['data']
+        
         #如果修改了返回给客户端的内容，或者解压缩了gzip，必须修改Content-Length报头
-        for i, (k, v) in zip(range(len(respHeader._headers)), respHeader._headers):
-            if k.lower() == 'Content-Length'.lower():
-                respHeader._headers[i] = respHeader.policy.header_store_parse(k, str(len(data)))
-                break 
-        self.send_response(resp.getcode())
+        if respHeader['Content-Length']:
+            respHeader.replace_header('Content-Length', str(len(data)))
+        
+        self.send_response(respCode)
         self.send_headers(respHeader)
         self.end_headers()
         self.wfile.write(data)
-
+        
+        
     #设置响应HTTP头
     def send_headers(self, headers={}):
         for key in headers.keys():
-            self.send_header(key, headers[key])    
-               
-    def process(self,type):
- 
-        content =""
-        if type==1:#post方法，接收post参数
-            datas = self.rfile.read(int(self.headers['content-length']))
-            datas = urllib.unquote(datas).decode("utf-8", 'ignore')#指定编码方式
-            datas = transDicts(datas)#将参数转换为字典
-            if datas.has_key('data'):
-                content = "data:"+datas['data']+"\r\n"
- 
-        if '?' in self.path:
-            query = urllib.parse.splitquery(self.path)
-            action = query[0]
- 
-            if query[1]:#接收get参数
-                queryParams = {}
-                for qp in query[1].split('&'):
-                    kv = qp.split('=')
-                    queryParams[kv[0]] = urllib.parse.unquote(kv[1])#.decode("utf-8", 'ignore')
-                    content+= kv[0]+':'+queryParams[kv[0]]+"\r\n"
- 
-            #指定返回编码
-            enc="UTF-8"
-            content = content.encode(enc)
-            f = io.BytesIO()
-            f.write(content)
-            f.seek(0)
-            self.send_response(200)
-            self.send_header("Content-type", "text/html; charset=%s" % enc)
-            self.send_header("Content-Length", str(len(content)))
-            self.end_headers()
-            self.wfile.write(content)
+            self.send_header(key, headers[key])
 
-
-class KIZRequestHandlerListener:
+ 
+class KIZRequestInterceptor:
     
-    def log(self, msg):
-        print(msg)
+    def __init__(self):
+        pass
     
-    def onReceiveRequest(request):
-        print(request)
+    def beforeRequest(self, kizRequestHandler):
+        #print(kizRequestHandler.requestline)
+        pass
+    
+    def afterRequest(self, kizRequestHandler, response={}):
+        #if  'text/html' in response['header']['Content-Type']:
+            #response['data'] += b'<script>alert("inject code")</script>'
+        pass
+    
       
 class KIZHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
     '''
@@ -202,13 +202,12 @@ class KIZHttpErrorHandler(urllib.request.HTTPDefaultErrorHandler):
 
 class KIZThreadingHTTPServer(http.server.HTTPServer): 
     #----------------------------------------------------------------------
-    def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True, thread_num = 10, RequestHandlerListener=None):
+    def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True, thread_num = 10, RequestInterceptorClasses=[]):
             """Constructor.  
             thread_num 线程池默认的线程数量
-            RequestHandlerListener RequestHandler的事件监听器，只有当RequestHandler
+            
             """
-            #设置RequestHandler的监听器
-            self.RequestHandlerListener = RequestHandlerListener
+            self.requestInterceptorClasses = RequestInterceptorClasses
             #初始化线程池
             self.threadPool = ThreadPool.ThreadPool(thread_num)
             #设置urllib opener， HTTP server接收到请求时，需要通过urllib 转发出请求，这里全局设置urllib
@@ -229,11 +228,14 @@ class KIZThreadingHTTPServer(http.server.HTTPServer):
     #调用RequestHandler处理HTTP请求
     def finish_request(self, request, client_address):
         if self.RequestHandlerClass == KIZRequestHandler:
-            self.RequestHandlerClass(request, client_address, self, self.RequestHandlerListener)
+            interceptors = []
+            for interceptorClass in self.requestInterceptorClasses:
+                interceptors.append(interceptorClass())
+            self.RequestHandlerClass(request, client_address, self, interceptors)
         else:
             self.RequestHandlerClass(request, client_address, self)
 
-server_address = ('', 8080)
-httpd = KIZThreadingHTTPServer(server_address, KIZRequestHandler, thread_num=10, RequestHandlerListener=KIZRequestHandlerListener())  
+server_address = ('127.0.0.1', 8080)
+httpd = KIZThreadingHTTPServer(server_address, KIZRequestHandler, thread_num=20, RequestInterceptorClasses=[KIZRequestInterceptor])  
 print("Server started on %s, port %d....."%(server_address[0], server_address[1]))  
 httpd.serve_forever()  

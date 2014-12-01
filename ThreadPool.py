@@ -1,9 +1,6 @@
-#-*-encoding:utf-8-*-
+#_*_ encoding:utf-8 _*_
 '''
-Created on 2012-3-9
 @summary: 线程池
-@contact: mailto:zhanglixinseu@gmail.com
-@author: zhanglixin
 '''
 import sys
 import threading
@@ -62,7 +59,7 @@ class WorkerThread(threading.Thread):
                 try:
                     '''执行callable，讲请求和结果以tuple的方式放入requestQueue'''
                     result = request.callable(*request.args,**request.kwds)
-                    print(self.getName())
+                    #print(self.getName())
                     self._resultQueue.put((request,result))
                 except:
                     '''异常处理'''
