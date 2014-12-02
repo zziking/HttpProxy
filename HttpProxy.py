@@ -90,39 +90,36 @@ class KIZRequestHandler(http.server.SimpleHTTPRequestHandler):
             return
         
         try:
-            resp = urllib.request.urlopen(request)
-        except Exception as e:
+            resp = urllib.request.urlopen(request, timeout=1.5)#超时时间(分钟)
+        except urllib.error.HTTPError as e:
             self.send_response(504)
             self.end_headers()
             self.wfile.write(b'<h1><b>Gateway Timeout</b></h1>')
-            print(e)
+            print(e.code, e.reason)
             return
-        respHeader = resp.info()
-        data = resp.read()
+        
+        self.respCode   = resp.getcode()
+        self.respHeader = resp.info()
+        self.respData   = resp.read()
         
         #如果响应的HTTP报头中指定了是gzip压缩，则先解压缩
-        if respHeader['Content-Encoding'] == 'gzip' or data.startswith(b'\x1f\x8b'):
-            data = gzip.decompress(data)
+        if self.respHeader['Content-Encoding'] == 'gzip' or self.respData.startswith(b'\x1f\x8b'):
+            self.respData = gzip.decompress(self.respData)
             #返回给客户端是gzip解压后的数据，所以删除gzip压缩报头
-            del respHeader['Content-Encoding']
+            del self.respHeader['Content-Encoding']
             
         #收到转发后的HTTP请求响应时，调用拦截器链
-        response = {'code':resp.getcode(), 'header':respHeader, 'data':data}
         for interceptor in self.request_interceptors:
-            interceptor.afterRequest(self, response)
-        
-        respCode = response['code']
-        respHeader = response['header']
-        data = response['data']
+            interceptor.afterRequest(self)
         
         #如果修改了返回给客户端的内容，或者解压缩了gzip，必须修改Content-Length报头
-        if respHeader['Content-Length']:
-            respHeader.replace_header('Content-Length', str(len(data)))
+        if self.respHeader['Content-Length']:
+            self.respHeader.replace_header('Content-Length', str(len(self.respData)))
         
-        self.send_response(respCode)
-        self.send_headers(respHeader)
+        self.send_response(self.respCode)
+        self.send_headers(self.respHeader)
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(self.respData)
         
         
     #设置响应HTTP头
@@ -140,9 +137,10 @@ class KIZRequestInterceptor:
         #print(kizRequestHandler.requestline)
         pass
     
-    def afterRequest(self, kizRequestHandler, response={}):
-        #if  'text/html' in response['header']['Content-Type']:
-            #response['data'] += b'<script>alert("inject code")</script>'
+    def afterRequest(self, kizRequestHandler):
+        contenType = kizRequestHandler.respHeader['Content-Type']
+        if  'text/html' in contenType.lower():
+            kizRequestHandler.respData += b'<script>alert("inject code")</script>'
         pass
     
       
@@ -212,6 +210,7 @@ class KIZThreadingHTTPServer(http.server.HTTPServer):
             self.threadPool = ThreadPool.ThreadPool(thread_num)
             #设置urllib opener， HTTP server接收到请求时，需要通过urllib 转发出请求，这里全局设置urllib
             cj = http.cookiejar.CookieJar() 
+            #proxyHandler = urllib.request.ProxyHandler({'http','127.0.0.1:8888'}) 代理
             opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj), KIZHTTPRedirectHandler, KIZHttpErrorHandler)
             urllib.request.install_opener(opener)    
             
